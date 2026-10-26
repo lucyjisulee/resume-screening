@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import google.generativeai as genai
 import pandas as pd
 from pypdf import PdfReader
@@ -31,6 +32,28 @@ def save_jobs(jobs):
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
+# --- 개인정보 자동 마스킹 함수 (보안 필터) ---
+def mask_personal_info(text: str) -> str:
+    # 1. 주민등록번호 패턴 마스킹 (예: 950101-1234567 -> 950101-*******)
+    text = re.sub(r"(\d{6})[- ]?([1-4]\d{6})", r"\1-*******", text)
+
+    # 2. 전화번호 및 휴대전화 마스킹 (예: 010-1234-5678 -> 010-****-5678)
+    text = re.sub(
+        r"(01[016789]|02|0[3-9]\d{1})[- ]?(\d{3,4})[- ]?(\d{4})",
+        r"\1-****-\3",
+        text,
+    )
+
+    # 3. 이메일 주소 마스킹 (예: recruit@company.com -> r***@company.com)
+    text = re.sub(
+        r"([a-zA-Z0-9_.+-])[a-zA-Z0-9_.+-]*@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)",
+        r"\1***@\2",
+        text,
+    )
+
+    return text
+
+
 # --- PDF 텍스트 추출 함수 ---
 def extract_pdf_text(uploaded_file):
     reader = PdfReader(uploaded_file)
@@ -46,7 +69,6 @@ def extract_pdf_text(uploaded_file):
 with st.sidebar:
     st.header("🔒 시스템 접근 인증")
 
-    # secrets에 등록되어 있으면 자동 로드, 아니면 입력창 노출
     env_password = st.secrets.get("TEAM_PASSWORD", "")
     env_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -90,7 +112,7 @@ jobs_dict = load_jobs()
 with tab_screening:
     st.title("📄 지원자 이력서 자동 스크리닝")
     st.caption(
-        "공고를 선택하고 지원자들의 PDF 이력서를 업로드하면 AI가 평가 등급과 사유를 정리합니다."
+        "개인정보(주민번호, 전화번호, 이메일)는 AI 분석 전 자동으로 비식별 마스킹 처리됩니다."
     )
 
     if not jobs_dict:
@@ -112,7 +134,7 @@ with tab_screening:
 
         with col2:
             uploaded_resumes = st.file_uploader(
-                "지원자 이력서 PDF 다중 업로드 (여러 개 동시 선택 가능)",
+                "지원자 이력서 PDF 다중 업로드 (드래그 앤 드롭 가능)",
                 type=["pdf"],
                 accept_multiple_files=True,
             )
@@ -128,11 +150,13 @@ with tab_screening:
 
             for idx, resume_file in enumerate(uploaded_resumes):
                 status_text.text(
-                    f"[{idx+1}/{len(uploaded_resumes)}] {resume_file.name} 분석 중..."
+                    f"[{idx+1}/{len(uploaded_resumes)}] {resume_file.name} 분석 중 (보안 마스킹 적용)..."
                 )
 
                 try:
-                    resume_text = extract_pdf_text(resume_file)
+                    # PDF 텍스트 추출 후 즉시 개인 식별 정보 마스킹 적용
+                    raw_text = extract_pdf_text(resume_file)
+                    masked_resume_text = mask_personal_info(raw_text)
 
                     prompt = f"""
 당신은 기업의 전문 인사담당자(채용 심사관)입니다.
@@ -152,19 +176,19 @@ with tab_screening:
    - C: 필수 요건 충족이 다소 애매하거나 직무 핏이 낮음
    - 탈락: 필수 요건을 명백히 충족하지 못함
 2. 학점(GPA) 특별 규칙:
-   - 기본적으로 학점 3.0 이상을 권장하나, 이력서에 학점이 아예 기재되어 있지 않은 경우 절대로 탈락(Fail) 사유로 삼지 마세요.
-   - 학점이 기재되어 있지 않다면 '메모_확인필요' 항목에 반드시 '이력서 확인 필요(학점 미기재)'라고 적고, 다른 필수 요건을 중심으로 등급을 산정하세요.
+   - 기본적으로 학점 3.0 이상을 권장하나, 이력서에 학점이 아예 기재되어 있지 않은 경우 절대로 탈락 사유로 삼지 마세요.
+   - 학점이 기재되어 있지 않다면 '메모_확인필요' 항목에 반드시 '이력서 확인 필요(학점 미기재)'라고 명시하고, 다른 필수 요건을 중심으로 등급을 산정하세요.
 
-[지원자 이력서 원문]
-{resume_text[:12000]}
+[지원자 이력서 원문 (개인 식별정보 마스킹됨)]
+{masked_resume_text[:12000]}
 
 [출력 형식]
-순수한 JSON 객체만 반환하세요. 마크다운 따옴표나 기타 텍스트는 포함하지 마세요.
+반드시 유효한 JSON 객체만 반환하세요.
 {{
-  "지원자명": "이름 (추정 불가 시 '미상')",
+  "지원자명": "이름 (마스킹으로 추정 불가 시 '미상')",
   "평가등급": "S, A, B, C, 탈락 중 택 1",
   "필수요건_충족여부": "충족 / 미충족 / 보완필요 중 택 1",
-  "우대요건_해당사항": "충족하는 우대 요건을 요약",
+  "우대요건_해당사항": "충족하는 우대 요건 요약",
   "종합_평가사유": "서류 합격/불합격 및 등급 부여 핵심 사유 (2~3문장)",
   "메모_확인필요": "학점 미기재 확인 필요 여부 또는 서류상 확인이 필요한 특이점 (없으면 '해당 없음')"
 }}
@@ -187,7 +211,7 @@ with tab_screening:
                             "평가등급": "분석 실패",
                             "필수요건_충족여부": "오류",
                             "우대요건_해당사항": "-",
-                            "종합_평가사유": f"분석 중 에러 발생: {str(e)}",
+                            "종합_평가사유": f"분석 에러: {str(e)}",
                             "메모_확인필요": "재확인 필요",
                         }
                     )
@@ -196,7 +220,6 @@ with tab_screening:
 
             status_text.text("✅ 모든 지원자 서류 스크리닝이 완료되었습니다!")
 
-            # 결과 데이터프레임 변환
             df = pd.DataFrame(results)
             column_order = [
                 "지원자명",
@@ -209,10 +232,9 @@ with tab_screening:
             ]
             df = df[[col for col in column_order if col in df.columns]]
 
-            st.subheader("📊 스크리닝 결과 요약")
+            st.subheader("📊 스크리닝 결과")
             st.dataframe(df, use_container_width=True)
 
-            # 엑셀 다운로드 파일 생성
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="스크리닝결과")
@@ -231,26 +253,26 @@ with tab_screening:
 with tab_job_manager:
     st.title("⚙️ 채용 공고 관리")
     st.caption(
-        "사람인 등 채용 포털의 공고 텍스트를 복사해 붙여넣으면 AI가 기준을 자동으로 분류하여 등록합니다."
+        "사람인 공고 본문을 복사해 붙여넣으면 AI가 기준을 추출해 목록에 추가합니다."
     )
 
     st.subheader("➕ 새 공고 등록 (텍스트 복사-붙여넣기)")
     raw_job_text = st.text_area(
-        "사람인 공고 본문 텍스트 전체 붙여넣기 (Ctrl+A -> Ctrl+C -> 붙여넣기)",
-        height=200,
-        placeholder="채용 공고 웹페이지의 텍스트를 그대로 드래그하여 여기에 붙여넣으세요...",
+        "사람인 공고 본문 전체 붙여넣기 (Ctrl+A -> Ctrl+C -> 여기에 Ctrl+V)",
+        height=180,
+        placeholder="채용 공고 웹페이지 본문 글자를 전체 복사해 여기에 붙여넣으세요...",
     )
 
-    if st.button("🤖 AI로 공고 기준 자동 추출 및 저장"):
+    if st.button("🤖 AI로 공고 기준 자동 추출 및 등록"):
         if not raw_job_text.strip():
             st.error("공고 텍스트를 입력해 주세요.")
         else:
-            with st.spinner("AI가 공고의 주요 요건을 분석 중입니다..."):
+            with st.spinner("AI가 공고 요건을 파악하고 있습니다..."):
                 try:
                     extractor_model = genai.GenerativeModel("gemini-2.5-flash")
                     extract_prompt = f"""
-다음은 채용 사이트에서 복사한 원문 텍스트입니다.
-이 내용에서 공고명, 주요 업무, 지원 필수 자격, 우대 사항을 추출하여 순수한 JSON 형식으로 반환하세요.
+채용 사이트에서 복사한 원문 텍스트입니다.
+공고명, 주요 업무, 지원 필수 자격, 우대 사항을 추출하여 순수한 JSON 형식으로 반환하세요.
 
 [원문 텍스트]
 {raw_job_text[:10000]}
@@ -258,9 +280,9 @@ with tab_job_manager:
 [출력 형식]
 {{
   "title": "공고명 (예: 백엔드 개발자 3년 이상)",
-  "duties": "담당 업무 항목 요약 정리",
-  "required": "필수 자격 요건 요약 정리",
-  "preferred": "우대 사항 요약 정리"
+  "duties": "담당 업무 항목 요약",
+  "required": "필수 자격 요건 요약",
+  "preferred": "우대 사항 요약"
 }}
 """
                     res = extractor_model.generate_content(
@@ -285,7 +307,7 @@ with tab_job_manager:
                     st.error(f"공고 추출 실패: {str(e)}")
 
     st.markdown("---")
-    st.subheader(f"📋 현재 등록된 공고 목록 ({len(jobs_dict)}개)")
+    st.subheader(f"📋 등록된 공고 목록 ({len(jobs_dict)}개)")
 
     if jobs_dict:
         for title, info in list(jobs_dict.items()):
