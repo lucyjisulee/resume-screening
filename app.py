@@ -54,20 +54,33 @@ def mask_personal_info(text: str) -> str:
     return text
 
 
-# --- 사람인 지원자 이름 고속 추출기 ---
-def extract_candidate_name(text: str, default_name: str) -> str:
-    # 1. "정상진 경력", "이솔지 신입" 패턴 매칭
-    m = re.search(r"([가-힣]{2,4})\s+(?:경력|신입)", text)
-    if m:
-        return m.group(1)
-    # 2. 파일명 링크 패턴 매칭 (이솔지_이력서.pdf 등)
-    m = re.search(r"([가-힣]{2,4})[_\s]이력서", text)
-    if m:
-        return m.group(1)
-    # 3. 성별/나이 앞 성명 매칭
-    m = re.search(r"([가-힣]{2,4})\s*[\n\r]+\s*(?:남|여),", text)
-    if m:
-        return m.group(1)
+# --- 사람인 지원자 성명 정밀 추출기 (상단 헤더 전용) ---
+def extract_candidate_name_accurate(text: str, default_name: str) -> str:
+    # 텍스트 최상단 800자만 잘라서 검사 (본문 경력단어 오염 방지)
+    header_text = text[:800]
+
+    # 패턴 1: "이름_이력서.pdf" 또는 "이름 이력서" 링크 패턴
+    m_file = re.search(r"([가-힣]{2,4})[_\s]이력서", header_text)
+    if m_file and m_file.group(1) not in ["사람인", "지원자"]:
+        return m_file.group(1)
+
+    # 패턴 2: "(남|여), 19XX(나이)" 바로 윗줄에 있는 순수 한글 이름
+    m_meta = re.search(
+        r"([가-힣]{2,4})(?:\s+(?:경력|신입))?[\r\n\s]+(?:남|여),\s*(?:19|20)\d{2}",
+        header_text,
+    )
+    if m_meta:
+        cand = m_meta.group(1).strip()
+        if cand not in ["인적사항", "기본정보", "이력서", "지원분야"]:
+            return cand
+
+    # 패턴 3: 상단 줄바꿈 기준으로 '경력/신입' 태그와 붙어있는 순수 한글 2~4글자
+    for line in header_text.splitlines()[:15]:
+        line = line.strip()
+        m_tag = re.match(r"^([가-힣]{2,4})\s+(?:경력|신입)$", line)
+        if m_tag:
+            return m_tag.group(1)
+
     return default_name
 
 
@@ -120,14 +133,27 @@ def split_candidates_from_pdf(uploaded_file):
     return candidate_chunks
 
 
-# --- 초고속 Gemini 호출 엔진 ---
-def call_gemini_fast(prompt: str) -> str:
+# --- Rate Limit(429) 자동 복구 탑재 Gemini 호출 엔진 ---
+def call_gemini_reliable(prompt: str, max_retries: int = 4) -> str:
     models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-    for model_name in models:
+    target_model = None
+
+    for m in models:
         try:
-            model = genai.GenerativeModel(model_name)
-            # 불필요한 추론 토큰 지연 방지
-            res = model.generate_content(
+            model = genai.GenerativeModel(m)
+            # 첫 연결 테스트
+            target_model = model
+            break
+        except Exception:
+            continue
+
+    if not target_model:
+        target_model = genai.GenerativeModel("gemini-3.8-flash")
+
+    last_error_msg = ""
+    for attempt in range(max_retries):
+        try:
+            res = target_model.generate_content(
                 prompt,
                 generation_config={
                     "response_mime_type": "application/json",
@@ -136,22 +162,25 @@ def call_gemini_fast(prompt: str) -> str:
             )
             return res.text
         except Exception as e:
-            if "404" in str(e).lower():
+            last_error_msg = str(e)
+            err_lower = last_error_msg.lower()
+
+            # 429(속도제한), Quota, ResourceExhausted 발생 시 대기 후 재시도
+            if any(
+                k in err_lower
+                for k in ["429", "quota", "resourceexhausted", "rate"]
+            ):
+                wait_time = 4 * (attempt + 1)
+                time.sleep(wait_time)
                 continue
-            time.sleep(1.5)
-            # 1회 재시도
-            try:
-                res = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "response_mime_type": "application/json",
-                        "temperature": 0.1,
-                    },
-                )
-                return res.text
-            except Exception:
+            elif "404" in err_lower:
+                # 404인 경우 대체 모델로 변경
+                target_model = genai.GenerativeModel("gemini-2.5-flash")
                 continue
-    raise Exception("AI 응답 지연 (잠시 후 다시 시도해 주세요)")
+            else:
+                time.sleep(2)
+
+    raise Exception(f"AI 응답 오류: {last_error_msg[:100]}")
 
 
 # --- 사이드바 인증 ---
@@ -185,7 +214,7 @@ with st.sidebar:
         st.warning("API 키를 등록해 주세요.")
         st.stop()
 
-# --- 메인 탭 구성 ---
+# --- 메인 탭 ---
 tab_screening, tab_job_manager = st.tabs(
     ["📄 이력서 대량 스크리닝", "⚙️ 공고 관리"]
 )
@@ -195,7 +224,7 @@ jobs_dict = load_jobs()
 # 탭 1: 이력서 대량 스크리닝
 # ==========================================
 with tab_screening:
-    st.title("📄 지원자 이력서 초고속 스크리닝")
+    st.title("📄 지원자 이력서 자동 스크리닝")
 
     if not jobs_dict:
         st.warning("먼저 '⚙️ 공고 관리' 탭에서 공고를 등록해 주세요.")
@@ -234,11 +263,11 @@ with tab_screening:
 
                 for idx, cand in enumerate(all_candidates):
                     cand_text = cand["text"]
-                    cand_name = extract_candidate_name(
+                    cand_name = extract_candidate_name_accurate(
                         cand_text, f"지원자 {cand['candidate_seq']}번"
                     )
 
-                    # [핵심 로직] 사람인 별도 첨부파일 제출자 감지 (AI 호출 생략 -> 0.01초 처리)
+                    # 별도 첨부파일 제출자 감지 (AI 호출 없이 0.01초 즉시 처리)
                     is_attachment_only = (
                         "파일 미리 보기" in cand_text
                         and "인쇄 및 저장이 되지 않습니다" in cand_text
@@ -246,7 +275,7 @@ with tab_screening:
 
                     if is_attachment_only:
                         status_text.text(
-                            f"[{idx+1}/{total_cands}] {cand_name} (별도 첨부파일 확인 필요 - 고속 처리 완료)"
+                            f"[{idx+1}/{total_cands}] {cand_name} (별도 첨부파일 확인 필요)"
                         )
                         results.append(
                             {
@@ -254,7 +283,7 @@ with tab_screening:
                                 "평가등급": "확인필요",
                                 "필수요건_충족여부": "보완필요 (첨부확인)",
                                 "우대요건_해당사항": "별도 서류 제출",
-                                "종합_평가사유": "사람인 기본 웹 양식 대신 별도 첨부파일(이력서/자기소개서)을 등록한 지원자입니다. 원본 파일을 직접 확인해야 합니다.",
+                                "종합_평가사유": "사람인 웹 양식 대신 별도 첨부파일(이력서/자기소개서)을 등록한 지원자입니다. 원본 파일을 직접 열람해야 합니다.",
                                 "메모_확인필요": "이력서 개별 확인 필요 (별도 첨부파일 제출자)",
                                 "페이지": cand["page_range"],
                                 "파일명": cand["filename"],
@@ -263,14 +292,14 @@ with tab_screening:
                         progress_bar.progress((idx + 1) / total_cands)
                         continue
 
-                    # 일반 지원자: 핵심 텍스트만 추출 후 AI 분석
+                    # 일반 지원자 AI 심사
                     status_text.text(
-                        f"[{idx+1}/{total_cands}] {cand_name} 분석 중..."
+                        f"[{idx+1}/{total_cands}] {cand_name} 심사 진행 중..."
                     )
                     masked_text = mask_personal_info(cand_text)
 
                     eval_prompt = f"""
-당신은 채용 심사관입니다. 지원자 이력서를 분석해 JSON으로만 답하세요. 긴 생각이나 사족은 생략하고 핵심만 신속히 작성하세요.
+당신은 채용 심사관입니다. 지원자 이력서를 분석해 유효한 JSON 객체만 답하세요. 사족은 생략하세요.
 
 [공고 기준]
 - 공고명: {selected_job_title}
@@ -297,12 +326,12 @@ with tab_screening:
   "평가등급": "S, A, B, C, 탈락 중 1개",
   "필수요건_충족여부": "충족 / 미충족 / 보완필요 중 1개",
   "우대요건_해당사항": "충족 우대요건 요약",
-  "종합_평가사유": "핵심 사유 1~2문장",
+  "종합_평가사유": "등급 부여 핵심 사유 2문장",
   "메모_확인필요": "학점 미기재 여부 등 특이점 (없으면 '해당 없음')"
 }}
 """
                     try:
-                        raw_json = call_gemini_fast(eval_prompt)
+                        raw_json = call_gemini_reliable(eval_prompt)
                         parsed = json.loads(raw_json)
                         parsed["지원자명"] = cand_name
                         parsed["페이지"] = cand["page_range"]
@@ -315,7 +344,7 @@ with tab_screening:
                                 "평가등급": "재확인",
                                 "필수요건_충족여부": "미확인",
                                 "우대요건_해당사항": "-",
-                                "종합_평가사유": f"분석 일시 오류: {str(e)}",
+                                "종합_평가사유": f"분석 오류: {str(e)}",
                                 "메모_확인필요": "수동 확인 요망",
                                 "페이지": cand["page_range"],
                                 "파일명": cand["filename"],
@@ -323,10 +352,11 @@ with tab_screening:
                         )
 
                     progress_bar.progress((idx + 1) / total_cands)
-                    time.sleep(0.5)
+                    # 무료 계정의 분당 호출 한도 보호를 위해 2.5초 대기
+                    time.sleep(2.5)
 
                 status_text.text(
-                    f"✅ 총 {total_cands}명의 스크리닝이 완료되었습니다!"
+                    f"✅ 총 {total_cands}명의 스크리닝이 모두 완료되었습니다!"
                 )
 
                 df = pd.DataFrame(results)
@@ -387,7 +417,7 @@ with tab_job_manager:
 }}
 """
                 try:
-                    res_json = call_gemini_fast(extract_prompt)
+                    res_json = call_gemini_reliable(extract_prompt)
                     parsed_job = json.loads(res_json)
                     job_title = parsed_job.get("title", "새 채용공고")
 
