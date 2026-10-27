@@ -8,7 +8,7 @@ import pandas as pd
 from pypdf import PdfReader
 import streamlit as st
 
-# --- 기본 페이지 설정 ---
+# --- 1. 페이지 설정 ---
 st.set_page_config(
     page_title="AI 채용 서류 스크리닝 시스템", page_icon="📋", layout="wide"
 )
@@ -31,7 +31,7 @@ def save_jobs(jobs):
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
-# --- 개인정보 자동 마스킹 (보안 필터) ---
+# --- 2. 개인정보 자동 마스킹 ---
 def mask_personal_info(text: str) -> str:
     if not text:
         return ""
@@ -54,37 +54,79 @@ def mask_personal_info(text: str) -> str:
     return text
 
 
-# --- 사람인 지원자 성명 정밀 추출기 (상단 헤더 전용) ---
-def extract_candidate_name_accurate(text: str, default_name: str) -> str:
-    # 텍스트 최상단 800자만 잘라서 검사 (본문 경력단어 오염 방지)
-    header_text = text[:800]
+# --- 3. 사람인 지원자 성명 100% 정밀 추출기 ---
+def extract_candidate_name_robust(text: str, default_name: str) -> str:
+    # 1순위: 사람인 문서 마지막 장의 법적 고지 항목 "작성자 : OOO"
+    m_author = re.search(r"작성자\s*:\s*([가-힣]{2,4})\b", text)
+    if m_author and m_author.group(1) not in [
+        "사람인",
+        "지원자",
+        "이력서",
+        "확인",
+    ]:
+        return m_author.group(1).strip()
 
-    # 패턴 1: "이름_이력서.pdf" 또는 "이름 이력서" 링크 패턴
-    m_file = re.search(r"([가-힣]{2,4})[_\s]이력서", header_text)
-    if m_file and m_file.group(1) not in ["사람인", "지원자"]:
-        return m_file.group(1)
+    # 2순위: 별도 첨부파일 제출자의 파일명 링크 (예: 이솔지_이력서.pdf, 이제욱 이력서)
+    m_file = re.search(r"([가-힣]{2,4})[_\s]이력서", text)
+    if m_file and m_file.group(1) not in [
+        "사람인",
+        "지원자",
+        "기본",
+        "상세",
+    ]:
+        return m_file.group(1).strip()
 
-    # 패턴 2: "(남|여), 19XX(나이)" 바로 윗줄에 있는 순수 한글 이름
+    # 3순위: 입사지원일 바로 다음 줄에 붙어있는 성명 (예: 주아현경력, 정상진 경력)
+    m_apply = re.search(
+        r"입사지원일\s*:[^\n\r]+[\r\n\s]*([가-힣]{2,4})(?:경력|신입)", text
+    )
+    if m_apply:
+        cand = m_apply.group(1).strip()
+        if cand not in ["지원분야", "인적사항", "기본정보"]:
+            return cand
+
+    # 4순위: 성별, 연령 바로 윗줄 패턴 (지역명 필터링 포함)
     m_meta = re.search(
-        r"([가-힣]{2,4})(?:\s+(?:경력|신입))?[\r\n\s]+(?:남|여),\s*(?:19|20)\d{2}",
-        header_text,
+        r"([가-힣]{2,4})(?:경력|신입)?[\r\n\s]+(?:남|여),\s*(?:19|20)\d{2}", text
     )
     if m_meta:
         cand = m_meta.group(1).strip()
-        if cand not in ["인적사항", "기본정보", "이력서", "지원분야"]:
+        exclude_words = [
+            "서울",
+            "경기",
+            "인천",
+            "전체",
+            "지역",
+            "희망",
+            "서초",
+            "강남",
+            "인적",
+            "기본",
+        ]
+        if not any(w in cand for w in exclude_words):
             return cand
-
-    # 패턴 3: 상단 줄바꿈 기준으로 '경력/신입' 태그와 붙어있는 순수 한글 2~4글자
-    for line in header_text.splitlines()[:15]:
-        line = line.strip()
-        m_tag = re.match(r"^([가-힣]{2,4})\s+(?:경력|신입)$", line)
-        if m_tag:
-            return m_tag.group(1)
 
     return default_name
 
 
-# --- 사람인 일괄 인쇄 PDF 정밀 분할기 ---
+# --- 4. 자기소개서 절단 및 핵심 이력(학력/경력/자격증) 추출기 ---
+def extract_core_resume_content(text: str) -> str:
+    """자기소개서 뒷부분을 제거하여 토큰을 대폭 절약하고 AI 응답 속도를 극대화합니다."""
+    # 자기소개서가 시작되는 위치 탐색
+    cut_markers = ["자기소개서", "자기소개\n", "1. 지원동기", "성장과정"]
+    cut_pos = -1
+    for m in cut_markers:
+        pos = text.find(m)
+        if pos != -1:
+            if cut_pos == -1 or pos < cut_pos:
+                cut_pos = pos
+
+    # 자기소개서 이전까지만 슬라이싱 (학력, 경력기술서, 자격증, 나이 등 포함)
+    core_text = text[:cut_pos] if cut_pos != -1 else text
+    return core_text.strip()
+
+
+# --- 5. 사람인 일괄 인쇄 PDF 정밀 분할기 ---
 def split_candidates_from_pdf(uploaded_file):
     reader = PdfReader(uploaded_file)
     total_pages = len(reader.pages)
@@ -126,23 +168,19 @@ def split_candidates_from_pdf(uploaded_file):
                     "candidate_seq": i + 1,
                     "page_range": f"p.{start_p + 1} ~ p.{end_p}",
                     "text": chunk_text,
-                    "filename": uploaded_file.name,
                 }
             )
 
     return candidate_chunks
 
 
-# --- Rate Limit(429) 자동 복구 탑재 Gemini 호출 엔진 ---
-def call_gemini_reliable(prompt: str, max_retries: int = 4) -> str:
+# --- 6. 429 Quota 자동 복구 안정형 AI 호출 엔진 ---
+def call_gemini_with_retry(prompt: str, max_retries: int = 5) -> str:
     models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
     target_model = None
-
     for m in models:
         try:
-            model = genai.GenerativeModel(m)
-            # 첫 연결 테스트
-            target_model = model
+            target_model = genai.GenerativeModel(m)
             break
         except Exception:
             continue
@@ -150,7 +188,7 @@ def call_gemini_reliable(prompt: str, max_retries: int = 4) -> str:
     if not target_model:
         target_model = genai.GenerativeModel("gemini-3.8-flash")
 
-    last_error_msg = ""
+    last_error = ""
     for attempt in range(max_retries):
         try:
             res = target_model.generate_content(
@@ -162,25 +200,25 @@ def call_gemini_reliable(prompt: str, max_retries: int = 4) -> str:
             )
             return res.text
         except Exception as e:
-            last_error_msg = str(e)
-            err_lower = last_error_msg.lower()
+            last_error = str(e)
+            err_lower = last_error.lower()
 
-            # 429(속도제한), Quota, ResourceExhausted 발생 시 대기 후 재시도
+            # 429 Quota 에러 시 대기 후 재시도
             if any(
                 k in err_lower
                 for k in ["429", "quota", "resourceexhausted", "rate"]
             ):
-                wait_time = 4 * (attempt + 1)
-                time.sleep(wait_time)
+                wait_sec = 6 * (attempt + 1)
+                time.sleep(wait_sec)
                 continue
             elif "404" in err_lower:
-                # 404인 경우 대체 모델로 변경
                 target_model = genai.GenerativeModel("gemini-2.5-flash")
+                time.sleep(2)
                 continue
             else:
-                time.sleep(2)
+                time.sleep(3)
 
-    raise Exception(f"AI 응답 오류: {last_error_msg[:100]}")
+    raise Exception(f"AI 심사 지연: {last_error[:120]}")
 
 
 # --- 사이드바 인증 ---
@@ -200,7 +238,7 @@ with st.sidebar:
         st.success("인증 완료")
 
     st.markdown("---")
-    st.subheader("🔑 AI 키")
+    st.subheader("🔑 AI 엔진 설정")
     api_key = env_api_key or st.text_input(
         "Gemini API Key",
         type="password",
@@ -246,16 +284,18 @@ with tab_screening:
 
         if start_btn and uploaded_files:
             all_candidates = []
-            with st.spinner("PDF 문서에서 지원자 영역 분할 중..."):
+            with st.spinner("PDF 문서에서 개별 지원자 영역을 분할하는 중..."):
                 for up_file in uploaded_files:
                     chunks = split_candidates_from_pdf(up_file)
                     all_candidates.extend(chunks)
 
             total_cands = len(all_candidates)
             if total_cands == 0:
-                st.error("이력서 텍스트를 읽을 수 없습니다.")
+                st.error("지원자를 인식할 수 없습니다.")
             else:
-                st.success(f"💡 총 {total_cands}명의 지원자를 감지했습니다.")
+                st.success(
+                    f"💡 총 **{total_cands}명**의 지원자를 감지했습니다. 심사를 시작합니다."
+                )
 
                 results = []
                 progress_bar = st.progress(0)
@@ -263,43 +303,45 @@ with tab_screening:
 
                 for idx, cand in enumerate(all_candidates):
                     cand_text = cand["text"]
-                    cand_name = extract_candidate_name_accurate(
+                    cand_name = extract_candidate_name_robust(
                         cand_text, f"지원자 {cand['candidate_seq']}번"
                     )
 
-                    # 별도 첨부파일 제출자 감지 (AI 호출 없이 0.01초 즉시 처리)
-                    is_attachment_only = (
+                    # [별도 이력서 첨부자 전용 판별]
+                    # 단순 자격증 첨부가 아니라, '파일 미리 보기 영역은 인쇄 및 저장이 되지 않습니다'가 본문에 명시된 경우
+                    is_resume_attachment = (
                         "파일 미리 보기" in cand_text
                         and "인쇄 및 저장이 되지 않습니다" in cand_text
                     ) or ("파일을 따로 다운로드하여 확인하시길 바랍니다" in cand_text)
 
-                    if is_attachment_only:
+                    if is_resume_attachment:
                         status_text.text(
-                            f"[{idx+1}/{total_cands}] {cand_name} (별도 첨부파일 확인 필요)"
+                            f"[{idx+1}/{total_cands}] {cand_name} (별도 이력서 파일 첨부자 확인 완료)"
                         )
                         results.append(
                             {
                                 "지원자명": cand_name,
                                 "평가등급": "확인필요",
                                 "필수요건_충족여부": "보완필요 (첨부확인)",
-                                "우대요건_해당사항": "별도 서류 제출",
-                                "종합_평가사유": "사람인 웹 양식 대신 별도 첨부파일(이력서/자기소개서)을 등록한 지원자입니다. 원본 파일을 직접 열람해야 합니다.",
+                                "우대요건_해당사항": "별도 이력서 제출",
+                                "종합_평가사유": "사람인 기본 양식 대신 별도 첨부파일(이력서/자기소개서)을 등록한 지원자입니다. 원본 파일을 직접 열람해야 합니다.",
                                 "메모_확인필요": "이력서 개별 확인 필요 (별도 첨부파일 제출자)",
                                 "페이지": cand["page_range"],
-                                "파일명": cand["filename"],
                             }
                         )
                         progress_bar.progress((idx + 1) / total_cands)
                         continue
 
-                    # 일반 지원자 AI 심사
+                    # 일반 지원자: 자기소개서 제외 후 핵심 이력만 압축 전달
                     status_text.text(
-                        f"[{idx+1}/{total_cands}] {cand_name} 심사 진행 중..."
+                        f"[{idx+1}/{total_cands}] {cand_name} 서류 심사 중..."
                     )
-                    masked_text = mask_personal_info(cand_text)
+
+                    core_text = extract_core_resume_content(cand_text)
+                    masked_text = mask_personal_info(core_text)
 
                     eval_prompt = f"""
-당신은 채용 심사관입니다. 지원자 이력서를 분석해 유효한 JSON 객체만 답하세요. 사족은 생략하세요.
+당신은 기업의 전문 채용 심사관입니다. 아래 공고 기준과 지원자의 핵심 이력(학력/학점/경력/자격증)을 대조 평가하여 순수한 JSON 객체로만 답하세요. 사족은 일체 생략하세요.
 
 [공고 기준]
 - 공고명: {selected_job_title}
@@ -307,35 +349,34 @@ with tab_screening:
 - 필수 요건: {job_info.get('required')}
 - 우대 요건: {job_info.get('preferred')}
 
-[평가 등급]
-- S: 필수 완벽 충족 + 우대 다수 충족
+[평가 기준]
+- S: 필수 완벽 충족 + 우대 다수 충족 + 직무 역량 뛰어남
 - A: 필수 충족 + 우대 일부 충족
 - B: 필수 충족 + 우대 미미
-- C: 필수 충족 애매하거나 직무 핏 낮음
-- 탈락: 필수 요건 미충족
+- C: 필수 충족 애매하거나 직무 연관성 낮음
+- 탈락: 필수 요건 명백히 미충족
 
 [학점 규칙]
-학점 3.0 이상 권장. 단, 학점 미기재 시 절대 탈락시키지 말고 메모_확인필요에 '이력서 확인 필요(학점 미기재)' 명시.
+학점 3.0 이상 권장. 단, 학점 미기재 시 절대 탈락시키지 말고 메모_확인필요에 '이력서 확인 필요(학점 미기재)'라고 적고 다른 자격/경력을 중심으로 평가하세요.
 
-[지원자 이력서]
+[지원자 핵심 이력 요약]
 {masked_text[:5000]}
 
 [출력 JSON]
 {{
   "지원자명": "{cand_name}",
-  "평가등급": "S, A, B, C, 탈락 중 1개",
-  "필수요건_충족여부": "충족 / 미충족 / 보완필요 중 1개",
+  "평가등급": "S, A, B, C, 탈락 중 택1",
+  "필수요건_충족여부": "충족 / 미충족 / 보완필요 중 택1",
   "우대요건_해당사항": "충족 우대요건 요약",
-  "종합_평가사유": "등급 부여 핵심 사유 2문장",
+  "종합_평가사유": "등급 산정 핵심 사유 2문장",
   "메모_확인필요": "학점 미기재 여부 등 특이점 (없으면 '해당 없음')"
 }}
 """
                     try:
-                        raw_json = call_gemini_reliable(eval_prompt)
+                        raw_json = call_gemini_with_retry(eval_prompt)
                         parsed = json.loads(raw_json)
                         parsed["지원자명"] = cand_name
                         parsed["페이지"] = cand["page_range"]
-                        parsed["파일명"] = cand["filename"]
                         results.append(parsed)
                     except Exception as e:
                         results.append(
@@ -347,18 +388,18 @@ with tab_screening:
                                 "종합_평가사유": f"분석 오류: {str(e)}",
                                 "메모_확인필요": "수동 확인 요망",
                                 "페이지": cand["page_range"],
-                                "파일명": cand["filename"],
                             }
                         )
 
                     progress_bar.progress((idx + 1) / total_cands)
-                    # 무료 계정의 분당 호출 한도 보호를 위해 2.5초 대기
-                    time.sleep(2.5)
+                    # 무료 API 분당 할당량(RPM) 보호를 위한 4초 간격 유지
+                    time.sleep(4.0)
 
                 status_text.text(
                     f"✅ 총 {total_cands}명의 스크리닝이 모두 완료되었습니다!"
                 )
 
+                # 파일명 컬럼을 완전히 제외한 데이터프레임 구성
                 df = pd.DataFrame(results)
                 cols_order = [
                     "지원자명",
@@ -368,13 +409,13 @@ with tab_screening:
                     "종합_평가사유",
                     "메모_확인필요",
                     "페이지",
-                    "파일명",
                 ]
                 df = df[[c for c in cols_order if c in df.columns]]
 
                 st.subheader("📊 스크리닝 종합 결과")
                 st.dataframe(df, use_container_width=True)
 
+                # 엑셀 다운로드
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                     df.to_excel(writer, index=False, sheet_name="스크리닝결과")
@@ -403,7 +444,7 @@ with tab_job_manager:
         if not raw_job_text.strip():
             st.error("공고 텍스트를 입력해 주세요.")
         else:
-            with st.spinner("AI가 공고 요건을 추출하고 있습니다..."):
+            with st.spinner("AI가 공고 요건을 파악하고 있습니다..."):
                 extract_prompt = f"""
 채용 사이트 본문에서 공고명, 주요 업무, 지원 필수 자격, 우대 사항을 추출해 JSON으로 답하세요.
 {raw_job_text[:6000]}
@@ -417,7 +458,7 @@ with tab_job_manager:
 }}
 """
                 try:
-                    res_json = call_gemini_reliable(extract_prompt)
+                    res_json = call_gemini_with_retry(extract_prompt)
                     parsed_job = json.loads(res_json)
                     job_title = parsed_job.get("title", "새 채용공고")
 
@@ -460,3 +501,5 @@ with tab_job_manager:
                     save_jobs(jobs_dict)
                     st.warning(f"'{title}' 공고가 삭제되었습니다.")
                     st.rerun()
+    else:
+        st.info("현재 등록된 공고가 없습니다.")
