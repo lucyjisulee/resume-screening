@@ -146,7 +146,7 @@ with tab_screening:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            model = genai.GenerativeModel("gemini-2.5-flash")
+            model = genai.GenerativeModel("gemini-2.0-flash")
 
             for idx, resume_file in enumerate(uploaded_resumes):
                 status_text.text(
@@ -269,7 +269,7 @@ with tab_job_manager:
         else:
             with st.spinner("AI가 공고 요건을 파악하고 있습니다..."):
                 try:
-                    extractor_model = genai.GenerativeModel("gemini-2.5-flash")
+                    extractor_model = genai.GenerativeModel("gemini-2.0-flash")
                     extract_prompt = f"""
 채용 사이트에서 복사한 원문 텍스트입니다.
 공고명, 주요 업무, 지원 필수 자격, 우대 사항을 추출하여 순수한 JSON 형식으로 반환하세요.
