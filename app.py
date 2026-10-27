@@ -8,7 +8,7 @@ import pandas as pd
 from pypdf import PdfReader
 import streamlit as st
 
-# --- 1. 페이지 기본 설정 ---
+# --- 기본 페이지 설정 ---
 st.set_page_config(
     page_title="AI 채용 서류 스크리닝 시스템", page_icon="📋", layout="wide"
 )
@@ -16,7 +16,7 @@ st.set_page_config(
 JOBS_FILE = "jobs_data.json"
 
 
-# --- 2. 데이터 영구 저장/불러오기 ---
+# --- 공고 저장/불러오기 ---
 def load_jobs():
     if os.path.exists(JOBS_FILE):
         try:
@@ -32,67 +32,65 @@ def save_jobs(jobs):
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
-# --- 3. 개인정보 자동 마스킹 (보안 필터) ---
+# --- 개인정보 자동 마스킹 (휴대폰, 유선번호, 이메일, 주민번호, 상세주소) ---
 def mask_personal_info(text: str) -> str:
     if not text:
         return ""
-    # 주민등록번호 패턴 마스킹 (950101-1234567, 9501011234567)
+    # 1. 주민등록번호 패턴
     text = re.sub(r"\b(\d{6})[- ]?([1-4]\d{6})\b", r"\1-*******", text)
-    # 휴대전화 및 일반 전화번호 마스킹 (010-1234-5678, 02-123-4567 등)
+    # 2. 휴대폰 및 전화번호 마스킹 (010-4170-8558 -> 010-****-8558)
     text = re.sub(
         r"\b(01[016789]|02|0[3-9]\d{1})[- ]?(\d{3,4})[- ]?(\d{4})\b",
         r"\1-****-\3",
         text,
     )
-    # 이메일 주소 마스킹 (user@example.com -> u***@example.com)
+    # 3. 이메일 주소 마스킹 (jsj970408@naver.com -> j***@naver.com)
     text = re.sub(
         r"\b([a-zA-Z0-9_.+-])[a-zA-Z0-9_.+-]*@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b",
         r"\1***@\2",
         text,
     )
+    # 4. 상세 주소 마스킹 (시/구 까지만 남기고 뒷부분 마스킹)
+    text = re.sub(
+        r"(\([0-9]{5}\)\s*[가-힣]+(?:\s+[가-힣]+)?)\s+[가-힣0-9\s-]+",
+        r"\1 [상세주소 마스킹]",
+        text,
+    )
     return text
 
 
-# --- 4. 사람인 통합 PDF 자동 분할 파서 ---
+# --- 사람인 일괄 인쇄 PDF 정밀 분할기 ---
 def split_candidates_from_pdf(uploaded_file):
-    """사람인 일괄 인쇄 PDF에서 지원자 단위로 페이지를 인식해 텍스트를 분할합니다."""
+    """사람인 이력서 상단의 '입사지원일 :' 및 '지원분야 :' 표식을 감지하여 지원자별로 정확히 분할합니다."""
     reader = PdfReader(uploaded_file)
     total_pages = len(reader.pages)
 
     if total_pages == 0:
         return []
 
-    # 전체 페이지 텍스트 추출
-    pages_text = []
-    for p in reader.pages:
-        extracted = p.extract_text() or ""
-        pages_text.append(extracted)
-
-    # 사람인 인쇄 헤더 마커
-    split_marker = "지원자 이력서 인쇄하기"
-    marker_indices = [
-        idx for idx, txt in enumerate(pages_text) if split_marker in txt
-    ]
-
-    # 마커 감지 기준 지원자 분할점 계산
+    pages_text = [p.extract_text() or "" for p in reader.pages]
     split_indices = []
-    # 마커가 2회 이상 발견되고, 매 페이지마다 찍히는 브라우저 머리글이 아닌 경우
-    if len(marker_indices) >= 2 and len(marker_indices) < total_pages:
-        split_indices = marker_indices
-    else:
-        # 보조 분할 로직: "기본정보/인적사항"과 "학력/경력"이 동시에 등장하는 첫 장 감지
-        for idx, txt in enumerate(pages_text):
-            if idx == 0:
-                split_indices.append(idx)
-            elif any(k in txt for k in ["기본정보", "인적사항", "입사지원서"]) and any(
-                k in txt for k in ["학력사항", "경력사항", "생년월일", "희망연봉"]
-            ):
-                split_indices.append(idx)
 
-    if not split_indices:
-        split_indices = [0]
+    # 사람인 각 지원자의 첫 페이지에만 등장하는 고유 표식 탐색
+    for idx, txt in enumerate(pages_text):
+        if idx == 0:
+            split_indices.append(0)
+            continue
 
-    # 지원자별로 페이지 구간 묶기
+        has_apply_date = bool(re.search(r"입사지원일\s*:", txt))
+        has_apply_field = bool(re.search(r"지원분야\s*:", txt))
+        has_profile_meta = bool(
+            re.search(r"(남|여),\s*(19|20)\d{2}\s*\(\d{1,2}세\)", txt)
+        )
+
+        # 지원분야와 입사지원일이 동시에 있거나, 인적사항 메타 정보가 매칭되는 경우 새 지원자 시작
+        if (has_apply_date and has_apply_field) or (
+            (has_apply_date or has_apply_field) and has_profile_meta
+        ):
+            split_indices.append(idx)
+
+    split_indices = sorted(list(set(split_indices)))
+
     candidate_chunks = []
     for i in range(len(split_indices)):
         start_p = split_indices[i]
@@ -114,8 +112,9 @@ def split_candidates_from_pdf(uploaded_file):
     return candidate_chunks
 
 
-# --- 5. 안전한 Gemini API 호출 엔진 (모델 폴백 + 속도 제한 대응) ---
+# --- Gemini API 안전 호출 (최신 gemini-3.8-flash 우선 적용) ---
 def call_gemini_safe(prompt: str, max_retries: int = 3) -> str:
+    # 에러 방지를 위해 3.8-flash 우선, 하위 호환 폴백
     models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
     last_error = None
 
@@ -133,16 +132,14 @@ def call_gemini_safe(prompt: str, max_retries: int = 3) -> str:
             except Exception as e:
                 err_msg = str(e).lower()
                 last_error = e
-                # 지원 종료 모델일 경우 다음 모델 즉시 시도
                 if "404" in err_msg or "not found" in err_msg:
-                    continue
-                # API 호출 한도(429) 초과 시 잠시 대기 후 재시도
+                    continue  # 지원 중단 모델이면 다음 모델 시도
                 elif (
                     "429" in err_msg
                     or "quota" in err_msg
                     or "resourceexhausted" in err_msg
                 ):
-                    time.sleep(3 * (attempt + 1))
+                    time.sleep(3 * (attempt + 1))  # 초당 호출 한도 초과 시 대기
                     break
                 else:
                     time.sleep(1)
@@ -151,7 +148,7 @@ def call_gemini_safe(prompt: str, max_retries: int = 3) -> str:
     raise Exception(f"AI 응답 생성 실패: {str(last_error)}")
 
 
-# --- 6. 사이드바 보안 인증 ---
+# --- 사이드바 인증 ---
 with st.sidebar:
     st.header("🔒 시스템 접근 인증")
     env_password = st.secrets.get("TEAM_PASSWORD", "")
@@ -181,10 +178,10 @@ with st.sidebar:
         st.session_state["api_key"] = api_key
         genai.configure(api_key=api_key)
     else:
-        st.warning("API 키를 입력해 주세요.")
+        st.warning("API 키를 등록해 주세요.")
         st.stop()
 
-# --- 7. 메인 화면 ---
+# --- 메인 화면 탭 구성 ---
 tab_screening, tab_job_manager = st.tabs(
     ["📄 이력서 대량 스크리닝", "⚙️ 공고 관리 (상시 업데이트)"]
 )
@@ -196,7 +193,7 @@ jobs_dict = load_jobs()
 with tab_screening:
     st.title("📄 지원자 이력서 자동 스크리닝")
     st.caption(
-        "사람인 통합 PDF(20~80명 분량)를 통째로 업로드해도 지원자별로 자동 쪼개어 정밀 평가합니다."
+        "사람인 일괄 인쇄 PDF(20~80명)를 올리면 지원자별로 자동 분할하여 개별 심사합니다."
     )
 
     if not jobs_dict:
@@ -218,7 +215,7 @@ with tab_screening:
 
         with col2:
             uploaded_files = st.file_uploader(
-                "사람인 통합 이력서 PDF 파일 업로드 (복수 업로드 가능)",
+                "사람인 통합 이력서 PDF 파일 업로드",
                 type=["pdf"],
                 accept_multiple_files=True,
             )
@@ -226,21 +223,18 @@ with tab_screening:
         start_btn = st.button("🚀 서류 스크리닝 시작", type="primary")
 
         if start_btn and uploaded_files:
-            # 1단계: 모든 파일에서 지원자 단위 청크 분할 수집
             all_candidates = []
-            with st.spinner("PDF 문서에서 개별 지원자 영역을 분할하는 중..."):
+            with st.spinner("이력서 PDF에서 개별 지원자 영역을 분할하는 중..."):
                 for up_file in uploaded_files:
                     chunks = split_candidates_from_pdf(up_file)
                     all_candidates.extend(chunks)
 
             total_cands = len(all_candidates)
             if total_cands == 0:
-                st.error(
-                    "이력서 텍스트를 읽을 수 없습니다. 정상적인 PDF 파일인지 확인해 주세요."
-                )
+                st.error("이력서 텍스트를 인식할 수 없습니다.")
             else:
-                st.info(
-                    f"💡 총 **{len(uploaded_files)}개**의 파일에서 **{total_cands}명**의 지원자를 성공적으로 감지했습니다. 분석을 시작합니다."
+                st.success(
+                    f"💡 총 **{len(uploaded_files)}개**의 파일에서 **{total_cands}명**의 지원자를 감지했습니다. 심사를 시작합니다!"
                 )
 
                 results = []
@@ -248,17 +242,16 @@ with tab_screening:
                 status_text = st.empty()
 
                 for idx, cand in enumerate(all_candidates):
-                    # 진행 상황 표시
                     status_text.text(
                         f"[{idx+1}/{total_cands}] 지원자 분석 중 ({cand['page_range']})..."
                     )
 
-                    # 개인정보 마스킹 처리
+                    # 보안을 위한 개인정보 자동 마스킹
                     masked_text = mask_personal_info(cand["text"])
 
                     eval_prompt = f"""
-당신은 기업의 전문 인사담당자(채용 심사관)입니다.
-아래 채용 공고 기준과 지원자 이력서를 엄격히 대조 평가하여 JSON 형식으로만 응답하세요.
+당신은 기업의 전문 채용 심사관입니다.
+아래 채용 공고 기준과 지원자 이력서를 비교 평가하여 JSON 형식으로만 응답하세요.
 
 [채용 공고 기준]
 - 공고명: {selected_job_title}
@@ -268,26 +261,25 @@ with tab_screening:
 
 [평가 및 등급 부여 규칙]
 1. 등급 체계:
-   - S: 필수 요건 완벽 충족 + 우대 사항 다수 충족 + 뛰어난 직무 핏
+   - S: 필수 요건 완벽 충족 + 우대 사항 다수 충족 + 뛰어난 직무 역량
    - A: 필수 요건 충족 + 우대 사항 일부 충족
    - B: 필수 요건 충족 + 우대 사항 미미
-   - C: 필수 요건 충족이 다소 애매하거나 직무 연관성 낮음
+   - C: 필수 요건 충족 애매하거나 직무 핏 낮음
    - 탈락: 필수 요건 명백히 미충족
-2. 학점(GPA) 예외 규칙:
-   - 학점 3.0 이상을 권장하나, 이력서에 학점이 전혀 적혀있지 않은 경우 절대 탈락(Fail) 사유로 삼지 마세요.
-   - 학점이 기재되지 않았다면 '메모_확인필요'에 반드시 '이력서 확인 필요(학점 미기재)'라고 적고, 경력/프로젝트 등 다른 필수 요건을 중심으로 등급을 산정하세요.
+2. 학점(GPA) 규칙:
+   - 학점 3.0 이상 권장이나, 이력서에 학점이 아예 적혀있지 않은 경우 절대 탈락(Fail)시키지 마세요.
+   - 학점 미기재 시 '메모_확인필요'에 '이력서 확인 필요(학점 미기재)'라고 적고, 경력/자격 등 다른 필수 요건을 중심으로 등급을 산정하세요.
 
-[지원자 이력서 원문 (개인식별정보 마스킹됨)]
+[지원자 이력서 원문 (개인정보 마스킹됨)]
 {masked_text[:12000]}
 
-[출력 형식]
-반드시 유효한 JSON 형식만 출력하세요.
+[출력 형식 (순수 JSON)]
 {{
-  "지원자명": "지원자 이름 (이력서 상단에서 추출, 식별 불가 시 '지원자 {cand['candidate_seq']}번')",
+  "지원자명": "이력서 상단의 지원자 성명 (추정 불가 시 '지원자 {cand['candidate_seq']}번')",
   "평가등급": "S, A, B, C, 탈락 중 택 1",
   "필수요건_충족여부": "충족 / 미충족 / 보완필요 중 택 1",
   "우대요건_해당사항": "충족하는 우대 요건 요약",
-  "종합_평가사유": "서류 등급 부여 핵심 사유 (2~3문장)",
+  "종합_평가사유": "서류 합격/탈락 및 등급 부여 사유 (2~3문장)",
   "메모_확인필요": "학점 미기재 확인 필요 여부 또는 특이사항 (없으면 '해당 없음')"
 }}
 """
@@ -304,7 +296,7 @@ with tab_screening:
                                 "평가등급": "오류",
                                 "필수요건_충족여부": "오류",
                                 "우대요건_해당사항": "-",
-                                "종합_평가사유": f"분석 오류 발생: {str(e)}",
+                                "종합_평가사유": f"분석 오류: {str(e)}",
                                 "메모_확인필요": "수동 확인 필요",
                                 "페이지": cand["page_range"],
                                 "파일명": cand["filename"],
@@ -312,11 +304,10 @@ with tab_screening:
                         )
 
                     progress_bar.progress((idx + 1) / total_cands)
-                    # API 연속 호출 과부하 방지를 위한 미세 딜레이
-                    time.sleep(1.2)
+                    time.sleep(1.0)  # 안정적인 연속 호출 간격
 
                 status_text.text(
-                    f"✅ 총 {total_cands}명의 서류 스크리닝이 완료되었습니다!"
+                    f"✅ 총 {total_cands}명의 스크리닝이 모두 완료되었습니다!"
                 )
 
                 df = pd.DataFrame(results)
@@ -335,7 +326,7 @@ with tab_screening:
                 st.subheader("📊 스크리닝 종합 결과")
                 st.dataframe(df, use_container_width=True)
 
-                # 엑셀 다운로드 파일 생성
+                # 엑셀 다운로드
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                     df.to_excel(writer, index=False, sheet_name="스크리닝결과")
@@ -357,7 +348,7 @@ with tab_job_manager:
 
     st.subheader("➕ 새 공고 등록")
     raw_job_text = st.text_area(
-        "사람인 공고 본문 붙여넣기 (담당업무/필수/우대 위주)",
+        "사람인 공고 본문 붙여넣기 (담당업무/자격요건/우대사항 위주)",
         height=180,
         placeholder="채용 공고 본문을 복사하여 여기에 붙여넣으세요...",
     )
@@ -376,7 +367,7 @@ with tab_job_manager:
 
 [출력 형식]
 {{
-  "title": "공고명 (예: 퍼포먼스 마케터 3년 이상)",
+  "title": "공고명 (예: 안전보건 관리자)",
   "duties": "담당 업무 항목 요약",
   "required": "필수 자격 요건 요약",
   "preferred": "우대 사항 요약"
